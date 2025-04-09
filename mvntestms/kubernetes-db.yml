@@ -1,0 +1,236 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: maven-test-db-sa-db
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: maven-test-db-sa-db-view
+subjects:
+  - kind: ServiceAccount
+    name: maven-test-db-sa-db
+    namespace: @NAMESPACE@
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: maven-test-db-cr
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: maven-test-db-cr
+rules:
+  - apiGroups: [""]
+    resources: ["services", "pods", "replicationcontrollers", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: ["extensions"]
+    resources: ["deployments", "replicasets", "jobs"]
+    verbs: ["get", "list", "watch", "create", "delete", "update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["cronjobs"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+---
+#Create a Secret to hold the MONGO_INITDB_ROOT_USERNAME/PASSWORD
+#so we can enable authentication
+apiVersion: v1
+data:
+  #echo -n "mongoadmin" | base64
+  username: bW9uZ29hZG1pbg==
+  #echo -n "adminpassword" | base64
+  password: YWRtaW5wYXNzd29yZA==
+kind: Secret
+metadata:
+  name: maven-test-db-secret
+type: Opaque
+---
+# Create a secret to hold a keyfile used to authenticate between replicaset members
+# this seems to need to be base64 encoded twice (might not be the case if this
+# was an actual file reference as per the examples, but we're using a simple key
+# here
+apiVersion: v1
+data:
+  #echo -n "CHANGEMECHANGEMECHANGEME" | base64 | base64
+  mongodb-keyfile: UTBoQlRrZEZUVVZEU0VGT1IwVk5SVU5JUVU1SFJVMUYK
+kind: Secret
+metadata:
+  name: maven-test-db-key
+type: Opaque
+---
+#Headless Service for StatefulSets
+apiVersion: v1
+kind: Service
+metadata:
+  name: maven-test-db
+  labels:
+    name: maven-test-db
+    app: maven-test-db
+    provider: sumerge
+    group: sumerge
+spec:
+  ports:
+    - port: 27017
+      targetPort: 27017
+  clusterIP: None
+  selector:
+    app: maven-test-db
+---
+# Now the fun part
+#
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: maven-test-db
+spec:
+  serviceName: maven-test-db
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        # Labels MUST match MONGO_SIDECAR_POD_LABELS
+        # and MUST differentiate between other mongo
+        # instances in the CLUSTER not just the namespace
+        # as the sidecar will search the entire cluster
+        # for something to configure
+        app: maven-test-db
+        environment: @NAMESPACE@
+    spec:
+      #Run the Pod using the service account
+      serviceAccountName: maven-test-db-sa-db
+      terminationGracePeriodSeconds: 10
+      #Prevent a Mongo Replica running on the same node as another (avoid single point of failure)
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - mongo
+              topologyKey: "kubernetes.io/hostname"
+      containers:
+        - name: maven-test-db
+          image: docker.io/library/mongo:4.4.5
+          command:
+            #Authentication adapted from https://gist.github.com/thilinapiy/0c5abc2c0c28efe1bbe2165b0d8dc115
+            #in order to pass the new admin user id and password in
+            - /bin/sh
+            - -c
+            - >
+              if [ -f /data/db/admin-user.lock ]; then
+                echo "KUBERNETES LOG $HOSTNAME- Starting Mongo Daemon with runtime settings (clusterAuthMode)"
+                #ensure wiredTigerCacheSize is set within the size of the containers memory limit
+                mongod --wiredTigerCacheSizeGB 0.5 --replSet rs0 --bind_ip 0.0.0.0 --clusterAuthMode keyFile --keyFile /etc/secrets-volume/mongodb-keyfile --setParameter authenticationMechanisms=SCRAM-SHA-1;
+              else
+                echo "KUBERNETES LOG $HOSTNAME- Starting Mongo Daemon with setup setting (authMode)"
+                mongod --auth;
+              fi;
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - >
+                    if [ ! -f /data/db/admin-user.lock ]; then
+                      echo "KUBERNETES LOG $HOSTNAME- no Admin-user.lock file found yet"
+                      #replaced simple sleep, with ping and test.
+                      while (! mongo --eval "db.adminCommand('ping')"); do sleep 10; echo "KUBERNETES LOG $HOSTNAME - waiting another 10 seconds for mongo to start" >> /data/db/configlog.txt; done;
+                      touch /data/db/admin-user.lock
+                      if [ "$HOSTNAME" = "maven-test-db-0" ]; then
+                        echo "KUBERNETES LOG $HOSTNAME- creating admin user ${MONGODB_USERNAME}"
+                        mongo --eval "db = db.getSiblingDB('admin'); db.createUser({ user: '${MONGODB_USERNAME}', pwd: '${MONGODB_PASSWORD}', roles: [{ role: 'root', db: 'admin' }]});" >> /data/db/config.log
+                      fi;
+                      echo "KUBERNETES LOG $HOSTNAME-shutting mongod down for final restart"
+                      mongod --shutdown;
+                    fi;
+          env:
+            - name: MONGODB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: maven-test-db-secret
+                  key: username
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: maven-test-db-secret
+                  key: password
+          ports:
+            - containerPort: 27017
+          livenessProbe:
+            exec:
+              command:
+                - mongo
+                - --eval
+                - "db.adminCommand('ping')"
+            initialDelaySeconds: 5
+            periodSeconds: 60
+            timeoutSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - mongo
+                - --eval
+                - "db.adminCommand('ping')"
+            initialDelaySeconds: 5
+            periodSeconds: 60
+            timeoutSeconds: 10
+          resources:
+            requests:
+              memory: "350Mi"
+              cpu: "0.05"
+            limits:
+              memory: "1Gi"
+              cpu: "0.1"
+          volumeMounts:
+            - name: maven-test-db-key
+              mountPath: "/etc/secrets-volume"
+              readOnly: true
+            - name: maven-test-db-persistent-storage
+              mountPath: /data/db
+        - name: maven-test-db-sidecar
+          image: cvallance/mongo-k8s-sidecar
+          env:
+            # Sidecar searches for any POD in the CLUSTER with these labels
+            # not just the namespace..so we need to ensure the POD is labelled
+            # to differentiate it from other PODS in different namespaces
+            - name: MONGO_SIDECAR_POD_LABELS
+              value: "app=maven-test-db,environment=@NAMESPACE@"
+            - name: MONGODB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: maven-test-db-secret
+                  key: username
+            - name: MONGODB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: maven-test-db-secret
+                  key: password
+            #don't be fooled by this..it's not your DB that
+            #needs specifying, it's the admin DB as that
+            #is what you authenticate against with mongo.
+            - name: MONGODB_DATABASE
+              value: admin
+      volumes:
+        - name: maven-test-db-key
+          secret:
+            defaultMode: 0400
+            secretName: maven-test-db-key
+  volumeClaimTemplates:
+    - metadata:
+        name: maven-test-db-persistent-storage
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
+  selector:
+    matchLabels:
+      app: maven-test-db

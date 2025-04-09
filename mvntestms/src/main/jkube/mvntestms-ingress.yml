@@ -1,0 +1,9 @@
+spec:
+  rules:
+    - host: "${host}"
+      http:
+        paths:
+          - backend:
+              serviceName: ${project.artifactId}
+              servicePort: 8080
+            path: "/maven-test/"

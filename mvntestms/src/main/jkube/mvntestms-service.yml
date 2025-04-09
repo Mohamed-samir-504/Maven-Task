@@ -1,0 +1,6 @@
+metadata:
+  annotations:
+    swagger: "http://${host}/maven-test/swagger-ui/index.html"
+    # prometheus.io/path: /actuator/prometheus
+spec:
+  type: "ClusterIP"
